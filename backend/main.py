@@ -8,12 +8,22 @@ from collections import Counter
 from datetime import datetime
 import statistics
 
+import os
+
 app = FastAPI(title="Report Analysis API")
 
 # CORS middleware to allow Laravel frontend to access the API
+# Allow specific origins from environment variable, or allow all for development
+cors_origins = os.getenv("CORS_ORIGINS", "*")
+if cors_origins == "*":
+    allow_origins = ["*"]
+else:
+    # Split comma-separated origins
+    allow_origins = [origin.strip() for origin in cors_origins.split(",")]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,41 +171,59 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
             
         elif chart_type == "line_chart":
             # Line chart - can be raw data or aggregated
-            if not config.x_column or not config.y_column:
-                raise ValueError("x_column and y_column are required for line chart")
-            
-            # Check if aggregation is requested
-            if config.aggregate:
-                # Aggregated mode - group by x_column and aggregate y_column values
-                aggregate_type = config.aggregate.upper()
+            # Check if it's aggregated mode (has column and aggregate) or raw mode (has x_column and y_column)
+            if config.column and config.aggregate:
+                # Aggregated mode - same structure as bar chart
+                if not config.column:
+                    raise ValueError("column is required for aggregated line chart")
+                
+                aggregate_type = (config.aggregate or "COUNT").upper()
+                aggregate_column = config.aggregate_column
                 
                 grouped_data = {}
                 for row in report_data:
-                    x_val = str(row.get(config.x_column, ""))
-                    y_val = row.get(config.y_column)
+                    col_val = str(row.get(config.column, ""))
                     
-                    if x_val and y_val is not None:
-                        try:
-                            y_val = float(y_val) if not isinstance(y_val, (int, float)) else y_val
-                            if x_val not in grouped_data:
-                                grouped_data[x_val] = []
-                            grouped_data[x_val].append(y_val)
-                        except (ValueError, TypeError):
-                            pass
+                    if col_val:
+                        if col_val not in grouped_data:
+                            grouped_data[col_val] = []
+                        
+                        if aggregate_type == "COUNT" and (not aggregate_column or aggregate_column == "all"):
+                            grouped_data[col_val].append(1)
+                        elif aggregate_type == "DISTINCT_COUNT":
+                            agg_col = aggregate_column if aggregate_column and aggregate_column != "all" else None
+                            if not agg_col:
+                                grouped_data[col_val].append(1)
+                            else:
+                                distinct_val = row.get(agg_col)
+                                if distinct_val is not None:
+                                    grouped_data[col_val].append(str(distinct_val))
+                        else:
+                            agg_col = aggregate_column if aggregate_column and aggregate_column != "all" else None
+                            if not agg_col:
+                                grouped_data[col_val].append(1)
+                            else:
+                                agg_val = row.get(agg_col)
+                                if agg_val is not None:
+                                    try:
+                                        agg_val = float(agg_val) if not isinstance(agg_val, (int, float)) else agg_val
+                                        grouped_data[col_val].append(agg_val)
+                                    except (ValueError, TypeError):
+                                        pass
                 
-                # Calculate aggregates for each x value
+                # Calculate aggregates
                 aggregated_data = {}
-                for x_val, y_values in grouped_data.items():
-                    aggregated_data[x_val] = aggregate_values(y_values, aggregate_type)
+                for col_val, values in grouped_data.items():
+                    aggregated_data[col_val] = aggregate_values(values, aggregate_type)
                 
-                # Sort by x value if possible (try to convert to date/number)
+                # Sort by column value if possible (try to convert to date/number)
                 sorted_items = sorted(aggregated_data.items(), key=lambda x: try_convert_sort(x[0]))
                 
                 result["data"] = {
                     "labels": [item[0] for item in sorted_items],
                     "values": [item[1] for item in sorted_items]
                 }
-            else:
+            elif config.x_column and config.y_column:
                 # Raw data mode - plot all points without aggregation (like XY chart)
                 points = []
                 skipped_count = 0
@@ -211,16 +239,26 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                             # Try to convert y to float
                             y_val = float(y_val) if not isinstance(y_val, (int, float)) else y_val
                             
-                            # Try to convert x to float
+                            # Try to convert x to float or date
                             try:
                                 x_val = float(x_val) if not isinstance(x_val, (int, float)) else x_val
                             except (ValueError, TypeError):
-                                # If x is a string, convert to numeric index
+                                # Try to parse as date first
                                 if isinstance(x_val, str):
-                                    if x_val not in x_string_map:
-                                        x_string_map[x_val] = x_index
-                                        x_index += 1
-                                    x_val = x_string_map[x_val]
+                                    try:
+                                        # Try common date formats
+                                        date_obj = datetime.strptime(x_val, "%Y-%m-%d")
+                                        x_val = date_obj.timestamp()  # Convert to timestamp
+                                    except (ValueError, TypeError):
+                                        try:
+                                            date_obj = datetime.strptime(x_val, "%Y-%m-%d %H:%M:%S")
+                                            x_val = date_obj.timestamp()
+                                        except (ValueError, TypeError):
+                                            # If not a date, convert to numeric index
+                                            if x_val not in x_string_map:
+                                                x_string_map[x_val] = x_index
+                                                x_index += 1
+                                            x_val = x_string_map[x_val]
                                 else:
                                     skipped_count += 1
                                     continue
@@ -238,6 +276,8 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                 result["data"] = {
                     "points": points
                 }
+            else:
+                raise ValueError("For line chart, either provide column+aggregate (aggregated mode) or x_column+y_column (raw mode)")
             
         elif chart_type == "xy_chart" or chart_type == "scatter_chart":
             # X-Y scatter chart
@@ -248,6 +288,32 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
             skipped_count = 0
             x_string_map = {}  # Map string x-values to numeric indices
             x_index = 0
+            is_date_column = False
+            date_format = None
+            
+            # Try to detect if x_column is a date column by checking first few rows
+            date_formats_to_try = [
+                ("%Y-%m-%d", "%Y-%m-%d"),
+                ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"),
+                ("%d-%b-%Y", "%d-%b-%Y"),  # 01-Feb-2026
+                ("%d/%b/%Y", "%d/%b/%Y"),
+                ("%d/%m/%Y", "%d/%m/%Y"),
+                ("%m/%d/%Y", "%m/%d/%Y"),
+            ]
+            
+            for row in report_data[:5]:  # Check first 5 rows
+                x_val = row.get(config.x_column)
+                if x_val and isinstance(x_val, str):
+                    for fmt, fmt_name in date_formats_to_try:
+                        try:
+                            datetime.strptime(x_val, fmt)
+                            is_date_column = True
+                            date_format = fmt
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                    if is_date_column:
+                        break
             
             for row in report_data:
                 x_val = row.get(config.x_column)
@@ -258,16 +324,51 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                         # Try to convert y to float
                         y_val = float(y_val) if not isinstance(y_val, (int, float)) else y_val
                         
-                        # Try to convert x to float
+                        # Try to convert x to float or date
                         try:
                             x_val = float(x_val) if not isinstance(x_val, (int, float)) else x_val
                         except (ValueError, TypeError):
-                            # If x is a string, convert to numeric index
+                            # Try to parse as date first
                             if isinstance(x_val, str):
-                                if x_val not in x_string_map:
-                                    x_string_map[x_val] = x_index
-                                    x_index += 1
-                                x_val = x_string_map[x_val]
+                                if is_date_column and date_format:
+                                    try:
+                                        date_obj = datetime.strptime(x_val, date_format)
+                                        x_val = date_obj.timestamp() * 1000  # Convert to milliseconds for Chart.js
+                                    except (ValueError, TypeError):
+                                        # If date parsing fails, try other formats
+                                        parsed = False
+                                        for fmt, _ in date_formats_to_try:
+                                            try:
+                                                date_obj = datetime.strptime(x_val, fmt)
+                                                x_val = date_obj.timestamp() * 1000
+                                                parsed = True
+                                                break
+                                            except (ValueError, TypeError):
+                                                continue
+                                        if not parsed:
+                                            # If not a date, convert to numeric index
+                                            if x_val not in x_string_map:
+                                                x_string_map[x_val] = x_index
+                                                x_index += 1
+                                            x_val = x_string_map[x_val]
+                                else:
+                                    # Try to parse as date anyway
+                                    parsed = False
+                                    for fmt, _ in date_formats_to_try:
+                                        try:
+                                            date_obj = datetime.strptime(x_val, fmt)
+                                            x_val = date_obj.timestamp() * 1000
+                                            is_date_column = True
+                                            parsed = True
+                                            break
+                                        except (ValueError, TypeError):
+                                            continue
+                                    if not parsed:
+                                        # If not a date, convert to numeric index
+                                        if x_val not in x_string_map:
+                                            x_string_map[x_val] = x_index
+                                            x_index += 1
+                                        x_val = x_string_map[x_val]
                             else:
                                 skipped_count += 1
                                 continue
@@ -283,7 +384,8 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                 result["warning"] = f"Skipped {skipped_count} rows with non-numeric values"
             
             result["data"] = {
-                "points": points
+                "points": points,
+                "x_is_date": is_date_column
             }
             
         elif chart_type == "grouped_bar_chart":
@@ -293,6 +395,28 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
             
             aggregate_type = (config.aggregate or "COUNT").upper()
             aggregate_column = config.aggregate_column
+            
+            # Validate that aggregate_column is provided for numeric aggregations
+            numeric_aggregations = ["SUM", "AVG", "MIN", "MAX", "MEDIAN", "MODE", "PERCENTAGE"]
+            if aggregate_type in numeric_aggregations:
+                if not aggregate_column or aggregate_column == "all":
+                    raise ValueError(f"aggregate_column is required for {aggregate_type} aggregation in grouped_bar_chart")
+                
+                # Verify the column exists in the data
+                if report_data and len(report_data) > 0:
+                    first_row = report_data[0]
+                    if aggregate_column not in first_row:
+                        # Try case-insensitive match
+                        matching_col = None
+                        for col in first_row.keys():
+                            if col.lower() == aggregate_column.lower():
+                                matching_col = col
+                                break
+                        if matching_col:
+                            aggregate_column = matching_col
+                        else:
+                            available_cols = ", ".join(list(first_row.keys())[:10])
+                            raise ValueError(f"Column '{aggregate_column}' not found in data. Available columns: {available_cols}")
             
             # Structure: {group_value: {series_value: [values]}}
             grouped_data = {}
@@ -328,11 +452,11 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                                 distinct_val = str(distinct_val)
                                 grouped_data[group_val][series_val].append(distinct_val)
                     else:
-                        # Aggregate a specific column
+                        # Aggregate a specific column (SUM, AVG, MIN, MAX, etc.)
                         agg_col = aggregate_column if aggregate_column and aggregate_column != "all" else None
                         if not agg_col:
-                            # Default: count rows
-                            grouped_data[group_val][series_val].append(1)
+                            # This shouldn't happen due to validation above, but handle gracefully
+                            raise ValueError(f"aggregate_column is required for {aggregate_type} aggregation")
                         else:
                             agg_val = row.get(agg_col)
                             if agg_val is not None:
@@ -340,6 +464,7 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                                     agg_val = float(agg_val) if not isinstance(agg_val, (int, float)) else agg_val
                                     grouped_data[group_val][series_val].append(agg_val)
                                 except (ValueError, TypeError):
+                                    # Skip non-numeric values
                                     pass
             
             # Sort series values for consistent ordering
@@ -355,7 +480,10 @@ def analyze_data_for_chart(report_data: List[Dict], config: ChartConfig) -> Dict
                 for series_val in sorted_series:
                     if group_val in grouped_data and series_val in grouped_data[group_val]:
                         values = grouped_data[group_val][series_val]
-                        aggregated_data[group_val][series_val] = aggregate_values(values, aggregate_type)
+                        if values:  # Only aggregate if there are values
+                            aggregated_data[group_val][series_val] = aggregate_values(values, aggregate_type)
+                        else:
+                            aggregated_data[group_val][series_val] = 0
                     else:
                         aggregated_data[group_val][series_val] = 0
             

@@ -63,26 +63,97 @@ class ReportController extends Controller
         $columns = array_keys($firstRow);
         $columnTypes = [];
         
+        // Sample multiple rows for better detection (up to 10 rows)
+        $sampleRows = array_slice($reportData, 0, min(10, count($reportData)));
+        
         foreach ($columns as $col) {
-            $sampleValue = $firstRow[$col] ?? null;
             $isNumeric = false;
             $isDate = false;
+            $dateCount = 0;
+            $numericCount = 0;
+            $totalSamples = 0;
             
-            if ($sampleValue !== null) {
+            // Check multiple sample values
+            foreach ($sampleRows as $row) {
+                $sampleValue = $row[$col] ?? null;
+                if ($sampleValue === null || $sampleValue === '') {
+                    continue;
+                }
+                $totalSamples++;
+                
                 // Check if numeric
                 if (is_numeric($sampleValue)) {
+                    $numericCount++;
+                } else if (is_string($sampleValue)) {
+                    // Check if date - try multiple formats
+                    $dateFormats = [
+                        '/^\d{4}-\d{2}-\d{2}/',                    // YYYY-MM-DD
+                        '/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/',  // YYYY-MM-DD HH:MM:SS
+                        '/^\d{2}-[A-Za-z]{3}-\d{4}/',              // DD-MMM-YYYY (e.g., 01-Feb-2026)
+                        '/^\d{2}\/[A-Za-z]{3}\/\d{4}/',            // DD/MMM/YYYY
+                        '/^\d{2}\/\d{2}\/\d{4}/',                  // DD/MM/YYYY or MM/DD/YYYY
+                        '/^\d{4}\/\d{2}\/\d{2}/',                  // YYYY/MM/DD
+                        '/^\d{1,2}-\d{1,2}-\d{4}/',                // D-M-YYYY or DD-MM-YYYY
+                        '/^[A-Za-z]{3} \d{1,2}, \d{4}/',           // MMM D, YYYY (e.g., Feb 1, 2026)
+                        '/^\d{1,2} [A-Za-z]{3} \d{4}/',            // D MMM YYYY (e.g., 1 Feb 2026)
+                    ];
+                    
+                    $matchesDate = false;
+                    foreach ($dateFormats as $format) {
+                        if (preg_match($format, $sampleValue)) {
+                            $matchesDate = true;
+                            break;
+                        }
+                    }
+                    
+                    // Additional check: Try to parse as date using PHP's date parsing
+                    if (!$matchesDate) {
+                        // Check if column name suggests it's a date
+                        $dateKeywords = ['date', 'time', 'created', 'updated', 'modified', 'timestamp'];
+                        $colLower = strtolower($col);
+                        foreach ($dateKeywords as $keyword) {
+                            if (strpos($colLower, $keyword) !== false) {
+                                // Try to parse with strtotime
+                                $timestamp = strtotime($sampleValue);
+                                if ($timestamp !== false) {
+                                    $matchesDate = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if ($matchesDate) {
+                        $dateCount++;
+                    }
+                }
+            }
+            
+            // Determine type based on majority of samples
+            if ($totalSamples > 0) {
+                $numericRatio = $numericCount / $totalSamples;
+                $dateRatio = $dateCount / $totalSamples;
+                
+                if ($numericRatio > 0.5) {
                     $isNumeric = true;
-                } else {
-                    // Check if date
-                    if (is_string($sampleValue) && preg_match('/^\d{4}-\d{2}-\d{2}/', $sampleValue)) {
-                        $isDate = true;
+                } else if ($dateRatio > 0.5) {
+                    $isDate = true;
+                } else if ($dateCount > 0) {
+                    // If at least one date found and column name suggests date, mark as date
+                    $dateKeywords = ['date', 'time', 'created', 'updated', 'modified', 'timestamp'];
+                    $colLower = strtolower($col);
+                    foreach ($dateKeywords as $keyword) {
+                        if (strpos($colLower, $keyword) !== false) {
+                            $isDate = true;
+                            break;
+                        }
                     }
                 }
             }
             
             $columnTypes[$col] = [
                 'type' => $isNumeric ? 'numeric' : ($isDate ? 'date' : 'categorical'),
-                'sample' => $sampleValue
+                'sample' => $firstRow[$col] ?? null
             ];
         }
 

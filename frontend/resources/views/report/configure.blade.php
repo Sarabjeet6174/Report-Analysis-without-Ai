@@ -245,33 +245,54 @@
                             <option value="aggregated">Aggregated</option>
                         </select>
                     </div>
+                    <div id="lineRawSection${index}">
                     <div class="form-group">
                         <label>X-axis Column:</label>
-                        <select name="x_column" required>
+                        <select name="x_column">
                             <option value="">Select column...</option>
-                            ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            ${columns.filter(c => columnTypes[c]?.type === 'numeric' || columnTypes[c]?.type === 'date').map(c => `<option value="${c}">${c}</option>`).join('')}
                         </select>
-                    </div>
-                    <div id="lineAggregateSection${index}" style="display: none;">
-                        <div class="form-group">
-                            <label>Aggregate Function:</label>
-                            <select name="aggregate">
-                                <option value="SUM">SUM</option>
-                                <option value="AVG">AVG (MEAN)</option>
-                                <option value="COUNT">COUNT</option>
-                                <option value="MIN">MIN</option>
-                                <option value="MAX">MAX</option>
-                                <option value="MEDIAN">MEDIAN</option>
-                            </select>
-                        </div>
+                        <small style="color: #666; display: block; margin-top: 5px;">Select date or numeric column for X-axis</small>
                     </div>
                     <div class="form-group">
                         <label>Y-axis Column:</label>
-                        <select name="y_column" required>
+                        <select name="y_column">
                             <option value="">Select column...</option>
-                            ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            ${columns.filter(c => columnTypes[c]?.type === 'numeric').map(c => `<option value="${c}">${c}</option>`).join('')}
                         </select>
-                        <small style="color: #666; display: block; margin-top: 5px;" id="lineChartHelp${index}">Select Y-axis column (raw data points)</small>
+                        <small style="color: #666; display: block; margin-top: 5px;">Select numeric column for Y-axis (raw data points)</small>
+                    </div>
+                    </div>
+                    <div id="lineAggregateSection${index}" style="display: none;">
+                        <div class="form-group">
+                            <label>Group By (X-axis):</label>
+                            <select name="column">
+                                <option value="">Select column...</option>
+                                ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Aggregate Function:</label>
+                            <select name="aggregate" id="lineAggregateSelect${index}">
+                                <option value="COUNT">COUNT</option>
+                                <option value="DISTINCT_COUNT">DISTINCT COUNT</option>
+                                <option value="SUM">SUM</option>
+                                <option value="AVG">AVG (MEAN)</option>
+                                <option value="MIN">MIN</option>
+                                <option value="MAX">MAX</option>
+                                <option value="MEDIAN">MEDIAN</option>
+                                <option value="MODE">MODE</option>
+                                <option value="PERCENTAGE">PERCENTAGE</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="lineAggregateOf${index}">
+                            <label>Aggregate Of (Y-axis Column):</label>
+                            <select name="aggregate_column" id="lineAggregateColumn${index}">
+                                <option value="all">All (for COUNT only)</option>
+                                ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            </select>
+                            <small style="color: #666; display: block; margin-top: 5px;">Select which column to aggregate (e.g., SUM of soTotalAmt, or DISTINCT COUNT of orderNo)</small>
+                        </div>
                     </div>
                 `;
             } else if (chartType === 'xy_chart') {
@@ -280,8 +301,9 @@
                         <label>X-axis Column:</label>
                         <select name="x_column" required>
                             <option value="">Select column...</option>
-                            ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
+                            ${columns.filter(c => columnTypes[c]?.type === 'numeric' || columnTypes[c]?.type === 'date').map(c => `<option value="${c}">${c}</option>`).join('')}
                         </select>
+                        <small style="color: #666; display: block; margin-top: 5px;">Select date or numeric column for X-axis</small>
                     </div>
                     <div class="form-group">
                         <label>Y-axis Column:</label>
@@ -289,6 +311,7 @@
                             <option value="">Select column...</option>
                             ${columns.filter(c => columnTypes[c]?.type === 'numeric').map(c => `<option value="${c}">${c}</option>`).join('')}
                         </select>
+                        <small style="color: #666; display: block; margin-top: 5px;">Select numeric column for Y-axis</small>
                     </div>
                 `;
             } else if (chartType === 'grouped_bar_chart') {
@@ -323,9 +346,9 @@
                         <label>Aggregate Of (Y-axis Column):</label>
                         <select name="aggregate_column" id="groupedAggregateColumn${index}">
                             <option value="all">All (for COUNT only)</option>
-                            ${columns.filter(c => columnTypes[c]?.type === 'numeric').map(c => `<option value="${c}">${c}</option>`).join('')}
+                            ${columns.map(c => `<option value="${c}">${c}</option>`).join('')}
                         </select>
-                        <small style="color: #666; display: block; margin-top: 5px;">Select which numeric column to aggregate (e.g., SUM of soTotalAmt)</small>
+                        <small style="color: #666; display: block; margin-top: 5px;">Select which column to aggregate (e.g., SUM of soTotalAmt, or DISTINCT COUNT of orderNo)</small>
                     </div>
                 `;
             }
@@ -350,38 +373,78 @@
 
             fieldsContainer.innerHTML = html;
 
+            // Helper function to update aggregate column dropdown based on aggregate type
+            const updateAggregateColumnOptions = (aggColSelect, aggregateType) => {
+                if (!aggColSelect) return;
+                
+                const currentValue = aggColSelect.value;
+                const numericColumns = columns.filter(c => columnTypes[c]?.type === 'numeric');
+                const allColumns = columns;
+                
+                // Clear existing options (except "all" if needed)
+                aggColSelect.innerHTML = '';
+                
+                // For COUNT and DISTINCT_COUNT, show all columns
+                if (aggregateType === 'COUNT' || aggregateType === 'DISTINCT_COUNT') {
+                    aggColSelect.innerHTML = '<option value="all">All (for COUNT only)</option>';
+                    allColumns.forEach(col => {
+                        aggColSelect.innerHTML += `<option value="${col}">${col}</option>`;
+                    });
+                } else {
+                    // For numeric aggregations (SUM, AVG, MIN, MAX, MEDIAN, MODE, PERCENTAGE), show only numeric columns
+                    numericColumns.forEach(col => {
+                        aggColSelect.innerHTML += `<option value="${col}">${col}</option>`;
+                    });
+                }
+                
+                // Try to preserve current selection if it's still valid
+                if (currentValue && Array.from(aggColSelect.options).some(opt => opt.value === currentValue)) {
+                    // Only preserve if it's a valid option for the current aggregate type
+                    if (aggregateType === 'COUNT' || aggregateType === 'DISTINCT_COUNT') {
+                        // For COUNT/DISTINCT_COUNT, any column is valid
+                        aggColSelect.value = currentValue;
+                    } else {
+                        // For numeric aggregations, only preserve if it's a numeric column
+                        const isNumeric = numericColumns.includes(currentValue);
+                        if (isNumeric) {
+                            aggColSelect.value = currentValue;
+                        } else if (numericColumns.length > 0) {
+                            // Reset to first numeric column if current selection is invalid
+                            aggColSelect.value = numericColumns[0];
+                        }
+                    }
+                } else if (numericColumns.length > 0 && aggregateType !== 'COUNT' && aggregateType !== 'DISTINCT_COUNT') {
+                    // Default to first numeric column for numeric aggregations
+                    aggColSelect.value = numericColumns[0];
+                } else if (aggregateType === 'COUNT' || aggregateType === 'DISTINCT_COUNT') {
+                    aggColSelect.value = 'all';
+                } else if (numericColumns.length === 0) {
+                    // No numeric columns available - this shouldn't happen, but handle gracefully
+                    aggColSelect.innerHTML = '<option value="">No numeric columns available</option>';
+                }
+            };
+            
             // Wait for DOM to update, then set up event listeners
             setTimeout(() => {
                 // Add event listener for aggregate change (bar/pie charts)
                 const aggregateSelect = fieldsContainer.querySelector('select[name="aggregate"]');
                 if (aggregateSelect && (chartType === 'bar_chart' || chartType === 'pie_chart')) {
                     const aggregateOfDiv = document.getElementById(`aggregateOf${index}`);
+                    const aggColSelect = document.getElementById(`aggregateColumn${index}`);
+                    
                     // Set initial state
+                    updateAggregateColumnOptions(aggColSelect, aggregateSelect.value);
                     if (aggregateSelect.value === 'COUNT') {
                         if (aggregateOfDiv) {
                             aggregateOfDiv.style.display = 'none';
-                            const aggColSelect = document.getElementById(`aggregateColumn${index}`);
                             if (aggColSelect) aggColSelect.value = 'all';
                         }
                     } else {
                         if (aggregateOfDiv) aggregateOfDiv.style.display = 'block';
-                        // For non-COUNT, remove "All" option if it exists
-                        const aggColSelect = document.getElementById(`aggregateColumn${index}`);
-                        if (aggColSelect) {
-                            const allOption = aggColSelect.querySelector('option[value="all"]');
-                            if (allOption) allOption.remove();
-                            // If current value is "all", reset to first numeric column
-                            if (aggColSelect.value === 'all' || !aggColSelect.value) {
-                                const numericOptions = aggColSelect.querySelectorAll('option');
-                                if (numericOptions.length > 0) {
-                                    aggColSelect.value = numericOptions[0].value;
-                                }
-                            }
-                        }
                     }
                     
                     aggregateSelect.addEventListener('change', function() {
-                        const aggColSelect = document.getElementById(`aggregateColumn${index}`);
+                        updateAggregateColumnOptions(aggColSelect, this.value);
                         if (this.value === 'COUNT') {
                             if (aggregateOfDiv) {
                                 aggregateOfDiv.style.display = 'none';
@@ -389,18 +452,6 @@
                             }
                         } else {
                             if (aggregateOfDiv) aggregateOfDiv.style.display = 'block';
-                            // Remove "All (for COUNT only)" option and ensure a column is selected
-                            if (aggColSelect) {
-                                const allOption = aggColSelect.querySelector('option[value="all"]');
-                                if (allOption) allOption.remove();
-                                // If current value is "all", reset to first column
-                                if (aggColSelect.value === 'all' || !aggColSelect.value) {
-                                    const options = aggColSelect.querySelectorAll('option');
-                                    if (options.length > 0) {
-                                        aggColSelect.value = options[0].value;
-                                    }
-                                }
-                            }
                         }
                         updateAutoFill(index, chartType);
                     });
@@ -410,50 +461,28 @@
                 const groupedAggregateSelect = fieldsContainer.querySelector('select[name="aggregate"]');
                 if (groupedAggregateSelect && chartType === 'grouped_bar_chart') {
                     const groupedAggregateOfDiv = document.getElementById(`groupedAggregateOf${index}`);
+                    const groupedAggColSelect = document.getElementById(`groupedAggregateColumn${index}`);
+                    
+                    // Set initial state
+                    updateAggregateColumnOptions(groupedAggColSelect, groupedAggregateSelect.value);
                     if (groupedAggregateSelect.value === 'COUNT') {
                         if (groupedAggregateOfDiv) {
                             groupedAggregateOfDiv.style.display = 'none';
-                            const aggColSelect = document.getElementById(`groupedAggregateColumn${index}`);
-                            if (aggColSelect) aggColSelect.value = 'all';
+                            if (groupedAggColSelect) groupedAggColSelect.value = 'all';
                         }
                     } else {
                         if (groupedAggregateOfDiv) groupedAggregateOfDiv.style.display = 'block';
-                        // For non-COUNT, remove "All" option if it exists
-                        const aggColSelect = document.getElementById(`groupedAggregateColumn${index}`);
-                        if (aggColSelect) {
-                            const allOption = aggColSelect.querySelector('option[value="all"]');
-                            if (allOption) allOption.remove();
-                            // If current value is "all", reset to first numeric column
-                            if (aggColSelect.value === 'all' || !aggColSelect.value) {
-                                const numericOptions = aggColSelect.querySelectorAll('option');
-                                if (numericOptions.length > 0) {
-                                    aggColSelect.value = numericOptions[0].value;
-                                }
-                            }
-                        }
                     }
                     
                     groupedAggregateSelect.addEventListener('change', function() {
-                        const aggColSelect = document.getElementById(`groupedAggregateColumn${index}`);
+                        updateAggregateColumnOptions(groupedAggColSelect, this.value);
                         if (this.value === 'COUNT') {
                             if (groupedAggregateOfDiv) {
                                 groupedAggregateOfDiv.style.display = 'none';
-                                if (aggColSelect) aggColSelect.value = 'all';
+                                if (groupedAggColSelect) groupedAggColSelect.value = 'all';
                             }
                         } else {
                             if (groupedAggregateOfDiv) groupedAggregateOfDiv.style.display = 'block';
-                            // Remove "All (for COUNT only)" option and ensure a numeric column is selected
-                            if (aggColSelect) {
-                                const allOption = aggColSelect.querySelector('option[value="all"]');
-                                if (allOption) allOption.remove();
-                                // If current value is "all", reset to first numeric column
-                                if (aggColSelect.value === 'all' || !aggColSelect.value) {
-                                    const numericOptions = aggColSelect.querySelectorAll('option');
-                                    if (numericOptions.length > 0) {
-                                        aggColSelect.value = numericOptions[0].value;
-                                    }
-                                }
-                            }
                         }
                         updateAutoFill(index, chartType);
                     });
@@ -462,29 +491,88 @@
                 // Add event listener for line chart mode change
                 if (chartType === 'line_chart') {
                     const lineModeSelect = fieldsContainer.querySelector('select[name="line_mode"]');
+                    const lineRawSection = document.getElementById(`lineRawSection${index}`);
                     const lineAggregateSection = document.getElementById(`lineAggregateSection${index}`);
-                    const lineChartHelp = document.getElementById(`lineChartHelp${index}`);
                     
                     if (lineModeSelect) {
                         // Set initial state
                         if (lineModeSelect.value === 'raw') {
+                            if (lineRawSection) lineRawSection.style.display = 'block';
                             if (lineAggregateSection) lineAggregateSection.style.display = 'none';
-                            if (lineChartHelp) lineChartHelp.textContent = 'Select Y-axis column (raw data points)';
                         } else {
+                            if (lineRawSection) lineRawSection.style.display = 'none';
                             if (lineAggregateSection) lineAggregateSection.style.display = 'block';
-                            if (lineChartHelp) lineChartHelp.textContent = 'Select which column to aggregate (e.g., SUM of soTotalAmt by orderDate)';
                         }
                         
                         lineModeSelect.addEventListener('change', function() {
                             if (this.value === 'raw') {
+                                if (lineRawSection) lineRawSection.style.display = 'block';
                                 if (lineAggregateSection) lineAggregateSection.style.display = 'none';
-                                if (lineChartHelp) lineChartHelp.textContent = 'Select Y-axis column (raw data points)';
                             } else {
+                                if (lineRawSection) lineRawSection.style.display = 'none';
                                 if (lineAggregateSection) lineAggregateSection.style.display = 'block';
-                                if (lineChartHelp) lineChartHelp.textContent = 'Select which column to aggregate (e.g., SUM of soTotalAmt by orderDate)';
                             }
                             updateAutoFill(index, chartType);
                         });
+                    }
+                    
+                    // Add event listener for aggregate change in line chart aggregated mode
+                    const lineAggregateSelect = fieldsContainer.querySelector('select[name="aggregate"]');
+                    if (lineAggregateSelect && lineModeSelect && lineModeSelect.value === 'aggregated') {
+                        const lineAggregateOfDiv = document.getElementById(`lineAggregateOf${index}`);
+                        const lineAggColSelect = document.getElementById(`lineAggregateColumn${index}`);
+                        
+                        // Set initial state
+                        updateAggregateColumnOptions(lineAggColSelect, lineAggregateSelect.value);
+                        if (lineAggregateSelect.value === 'COUNT') {
+                            if (lineAggregateOfDiv) {
+                                lineAggregateOfDiv.style.display = 'none';
+                                if (lineAggColSelect) lineAggColSelect.value = 'all';
+                            }
+                        } else {
+                            if (lineAggregateOfDiv) lineAggregateOfDiv.style.display = 'block';
+                        }
+                        
+                        lineAggregateSelect.addEventListener('change', function() {
+                            // Update options first
+                            updateAggregateColumnOptions(lineAggColSelect, this.value);
+                            if (this.value === 'COUNT') {
+                                if (lineAggregateOfDiv) {
+                                    lineAggregateOfDiv.style.display = 'none';
+                                    if (lineAggColSelect) lineAggColSelect.value = 'all';
+                                }
+                            } else {
+                                if (lineAggregateOfDiv) lineAggregateOfDiv.style.display = 'block';
+                                // Ensure a valid numeric column is selected
+                                const numericColumns = columns.filter(c => columnTypes[c]?.type === 'numeric');
+                                if (lineAggColSelect && numericColumns.length > 0) {
+                                    const currentVal = lineAggColSelect.value;
+                                    if (!numericColumns.includes(currentVal)) {
+                                        lineAggColSelect.value = numericColumns[0];
+                                    }
+                                }
+                            }
+                            updateAutoFill(index, chartType);
+                        });
+                        
+                        // Also update when mode changes to aggregated
+                        if (lineModeSelect) {
+                            lineModeSelect.addEventListener('change', function() {
+                                if (this.value === 'aggregated' && lineAggColSelect && lineAggregateSelect) {
+                                    // Small delay to ensure DOM is updated
+                                    setTimeout(() => {
+                                        updateAggregateColumnOptions(lineAggColSelect, lineAggregateSelect.value);
+                                        const numericColumns = columns.filter(c => columnTypes[c]?.type === 'numeric');
+                                        if (lineAggregateSelect.value !== 'COUNT' && lineAggregateSelect.value !== 'DISTINCT_COUNT') {
+                                            const currentVal = lineAggColSelect.value;
+                                            if (!numericColumns.includes(currentVal) && numericColumns.length > 0) {
+                                                lineAggColSelect.value = numericColumns[0];
+                                            }
+                                        }
+                                    }, 10);
+                                }
+                            });
+                        }
                     }
                 }
                 
@@ -513,9 +601,11 @@
                 const lineModeSelect = chartEl.querySelector('select[name="line_mode"]');
                 const xColumnSelect = chartEl.querySelector('select[name="x_column"]');
                 const yColumnSelect = chartEl.querySelector('select[name="y_column"]');
+                const columnSelect = chartEl.querySelector('select[name="column"]');
                 const aggregateSelect = chartEl.querySelector('select[name="aggregate"]');
+                const aggregateColumnSelect = chartEl.querySelector('select[name="aggregate_column"]');
                 
-                [lineModeSelect, xColumnSelect, yColumnSelect, aggregateSelect].forEach(select => {
+                [lineModeSelect, xColumnSelect, yColumnSelect, columnSelect, aggregateSelect, aggregateColumnSelect].forEach(select => {
                     if (select) {
                         select.addEventListener('change', () => updateAutoFill(index, chartType));
                     }
@@ -557,46 +647,78 @@
                 const aggregateColumn = chartEl.querySelector('select[name="aggregate_column"]')?.value;
                 
                 if (column) {
-                    if (xLabelInput && !xLabelInput.value) {
+                    // Always update X-axis label when column changes
+                    if (xLabelInput) {
                         xLabelInput.value = column;
                     }
                     
                     if (aggregate && aggregateColumn && aggregateColumn !== 'all') {
                         const yLabel = aggregate + ' of ' + aggregateColumn;
-                        if (yLabelInput && !yLabelInput.value) {
+                        if (yLabelInput) {
                             yLabelInput.value = yLabel;
                         }
-                        if (titleInput && !titleInput.value) {
-                            titleInput.value = column + ' vs ' + aggregateColumn;
+                        const newTitle = column + ' vs ' + aggregateColumn;
+                        if (titleInput) {
+                            titleInput.value = newTitle;
                         }
                     } else if (aggregate === 'COUNT' || aggregate === 'DISTINCT_COUNT') {
-                        if (yLabelInput && !yLabelInput.value) {
+                        if (yLabelInput) {
                             yLabelInput.value = 'Count';
                         }
-                        if (titleInput && !titleInput.value) {
-                            titleInput.value = aggregate + ' by ' + column;
+                        const newTitle = aggregate + ' by ' + column;
+                        if (titleInput) {
+                            titleInput.value = newTitle;
                         }
                     }
                 }
             } else if (chartType === 'line_chart') {
                 const lineMode = chartEl.querySelector('select[name="line_mode"]')?.value;
-                const xColumn = chartEl.querySelector('select[name="x_column"]')?.value;
-                const yColumn = chartEl.querySelector('select[name="y_column"]')?.value;
-                const aggregate = chartEl.querySelector('select[name="aggregate"]')?.value;
                 
-                if (xColumn && yColumn) {
-                    if (xLabelInput && !xLabelInput.value) {
-                        xLabelInput.value = xColumn;
-                    }
-                    if (yLabelInput && !yLabelInput.value) {
-                        if (lineMode === 'aggregated' && aggregate) {
-                            yLabelInput.value = aggregate + ' of ' + yColumn;
-                        } else {
+                if (lineMode === 'raw') {
+                    const xColumn = chartEl.querySelector('select[name="x_column"]')?.value;
+                    const yColumn = chartEl.querySelector('select[name="y_column"]')?.value;
+                    
+                    if (xColumn && yColumn) {
+                        if (xLabelInput && !xLabelInput.value) {
+                            xLabelInput.value = xColumn;
+                        }
+                        if (yLabelInput && !yLabelInput.value) {
                             yLabelInput.value = yColumn;
                         }
+                        if (titleInput && !titleInput.value) {
+                            titleInput.value = xColumn + ' vs ' + yColumn;
+                        }
                     }
-                    if (titleInput && !titleInput.value) {
-                        titleInput.value = xColumn + ' vs ' + yColumn;
+                } else {
+                    // Aggregated mode - same as bar chart
+                    const column = chartEl.querySelector('select[name="column"]')?.value;
+                    const aggregate = chartEl.querySelector('select[name="aggregate"]')?.value;
+                    const aggregateColumn = chartEl.querySelector('select[name="aggregate_column"]')?.value;
+                    
+                    if (column) {
+                        // Always update X-axis label when column changes
+                        if (xLabelInput) {
+                            xLabelInput.value = column;
+                        }
+                        
+                        if (aggregate && aggregateColumn && aggregateColumn !== 'all') {
+                            const yLabel = aggregate + ' of ' + aggregateColumn;
+                            if (yLabelInput) {
+                                yLabelInput.value = yLabel;
+                            }
+                            const newTitle = column + ' vs ' + aggregateColumn;
+                            if (titleInput) {
+                                titleInput.value = newTitle;
+                            }
+                        } else if (aggregate === 'COUNT' || aggregate === 'DISTINCT_COUNT') {
+                            if (yLabelInput) {
+                                yLabelInput.value = 'Count';
+                            }
+                            const newTitle = aggregate + ' by ' + column;
+                            if (titleInput) {
+                                titleInput.value = newTitle;
+                            }
+                        }
                     }
                 }
             } else if (chartType === 'xy_chart') {
@@ -621,19 +743,20 @@
                 const aggregateColumn = chartEl.querySelector('select[name="aggregate_column"]')?.value;
                 
                 if (groupColumn && seriesColumn) {
-                    if (xLabelInput && !xLabelInput.value) {
+                    // Always update X-axis label when group column changes
+                    if (xLabelInput) {
                         xLabelInput.value = groupColumn;
                     }
                     if (aggregate && aggregateColumn && aggregateColumn !== 'all') {
-                        if (yLabelInput && !yLabelInput.value) {
+                        if (yLabelInput) {
                             yLabelInput.value = aggregate + ' of ' + aggregateColumn;
                         }
                     } else if (aggregate === 'COUNT' || aggregate === 'DISTINCT_COUNT') {
-                        if (yLabelInput && !yLabelInput.value) {
+                        if (yLabelInput) {
                             yLabelInput.value = 'Count';
                         }
                     }
-                    if (titleInput && !titleInput.value) {
+                    if (titleInput) {
                         titleInput.value = seriesColumn + ' by ' + groupColumn;
                     }
                 }
@@ -702,11 +825,18 @@
                         config.aggregate_column = aggregateColumn;
                     }
                 } else if (chartType === 'line_chart') {
-                    config.x_column = chartEl.querySelector('select[name="x_column"]')?.value || '';
-                    config.y_column = chartEl.querySelector('select[name="y_column"]')?.value || '';
                     const lineMode = chartEl.querySelector('select[name="line_mode"]')?.value;
-                    if (lineMode === 'aggregated') {
+                    if (lineMode === 'raw') {
+                        config.x_column = chartEl.querySelector('select[name="x_column"]')?.value || '';
+                        config.y_column = chartEl.querySelector('select[name="y_column"]')?.value || '';
+                    } else {
+                        // Aggregated mode - same structure as bar chart
+                        config.column = chartEl.querySelector('select[name="column"]')?.value || '';
                         config.aggregate = chartEl.querySelector('select[name="aggregate"]')?.value || '';
+                        const aggregateColumn = chartEl.querySelector('select[name="aggregate_column"]')?.value || '';
+                        if (aggregateColumn && aggregateColumn !== 'all') {
+                            config.aggregate_column = aggregateColumn;
+                        }
                     }
                 } else if (chartType === 'xy_chart') {
                     config.x_column = chartEl.querySelector('select[name="x_column"]')?.value || '';
@@ -744,9 +874,16 @@
                     if (!config.column) errors.push(`Chart ${index + 1}: Group By column is required`);
                     if (!config.aggregate) errors.push(`Chart ${index + 1}: Aggregate function is required`);
                 } else if (config.chart_type === 'line_chart') {
-                    if (!config.x_column) errors.push(`Chart ${index + 1}: X-axis column is required`);
-                    if (!config.y_column) errors.push(`Chart ${index + 1}: Y-axis column is required`);
-                    if (!config.aggregate) errors.push(`Chart ${index + 1}: Aggregate function is required`);
+                    // Check if raw or aggregated mode
+                    if (config.x_column && config.y_column) {
+                        // Raw mode - x_column and y_column are required
+                        if (!config.x_column) errors.push(`Chart ${index + 1}: X-axis column is required`);
+                        if (!config.y_column) errors.push(`Chart ${index + 1}: Y-axis column is required`);
+                    } else {
+                        // Aggregated mode - same validation as bar chart
+                        if (!config.column) errors.push(`Chart ${index + 1}: Group By column is required`);
+                        if (!config.aggregate) errors.push(`Chart ${index + 1}: Aggregate function is required`);
+                    }
                 } else if (config.chart_type === 'xy_chart') {
                     if (!config.x_column) errors.push(`Chart ${index + 1}: X-axis column is required`);
                     if (!config.y_column) errors.push(`Chart ${index + 1}: Y-axis column is required`);

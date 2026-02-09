@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Report Analysis - Charts</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -140,31 +141,99 @@
             };
 
             if (chartType === 'xy_chart' || chartType === 'scatter_chart') {
-                // Scatter chart
+                // Scatter chart with colorful points
+                const points = data.points || [];
+                const isDateXAxis = data.x_is_date || false;
+                const vibrantColors = [
+                    'rgba(255, 99, 132, 0.8)',   // Pink/Red
+                    'rgba(54, 162, 235, 0.8)',   // Blue
+                    'rgba(255, 206, 86, 0.8)',   // Yellow
+                    'rgba(75, 192, 192, 0.8)',   // Teal
+                    'rgba(153, 102, 255, 0.8)',  // Purple
+                    'rgba(255, 159, 64, 0.8)',   // Orange
+                    'rgba(199, 199, 199, 0.8)',  // Gray
+                    'rgba(83, 102, 255, 0.8)',   // Indigo
+                    'rgba(255, 99, 255, 0.8)',   // Magenta
+                    'rgba(99, 255, 132, 0.8)',   // Green
+                    'rgba(255, 206, 86, 0.8)',   // Gold
+                    'rgba(54, 162, 235, 0.8)'    // Sky Blue
+                ];
+                
+                const borderColors = [
+                    'rgba(255, 99, 132, 1)',
+                    'rgba(54, 162, 235, 1)',
+                    'rgba(255, 206, 86, 1)',
+                    'rgba(75, 192, 192, 1)',
+                    'rgba(153, 102, 255, 1)',
+                    'rgba(255, 159, 64, 1)',
+                    'rgba(199, 199, 199, 1)',
+                    'rgba(83, 102, 255, 1)',
+                    'rgba(255, 99, 255, 1)',
+                    'rgba(99, 255, 132, 1)',
+                    'rgba(255, 206, 86, 1)',
+                    'rgba(54, 162, 235, 1)'
+                ];
+                
+                // Create arrays of colors for each point
+                const pointBackgroundColors = points.map((point, index) => 
+                    vibrantColors[index % vibrantColors.length]
+                );
+                const pointBorderColors = points.map((point, index) => 
+                    borderColors[index % borderColors.length]
+                );
+                
                 config.data = {
                     datasets: [{
                         label: chartData.title,
-                        data: data.points || [],
-                        backgroundColor: 'rgba(102, 126, 234, 0.6)',
-                        borderColor: 'rgba(102, 126, 234, 1)',
-                        pointRadius: 5,
-                        pointHoverRadius: 7
+                        data: points,
+                        backgroundColor: pointBackgroundColors,
+                        borderColor: pointBorderColors,
+                        pointRadius: 6,
+                        pointHoverRadius: 8,
+                        pointBorderWidth: 2
                     }]
                 };
-                config.options.scales = {
-                    x: {
-                        title: {
-                            display: !!chartData.x_label,
-                            text: chartData.x_label || 'X Axis'
+                
+                // Configure scales based on whether x-axis is date
+                if (isDateXAxis) {
+                    config.options.scales = {
+                        x: {
+                            type: 'time',
+                            time: {
+                                unit: 'day',
+                                displayFormats: {
+                                    day: 'DD-MMM-YYYY'
+                                },
+                                tooltipFormat: 'DD-MMM-YYYY'
+                            },
+                            title: {
+                                display: !!chartData.x_label,
+                                text: chartData.x_label || 'X Axis'
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: !!chartData.y_label,
+                                text: chartData.y_label || 'Y Axis'
+                            }
                         }
-                    },
-                    y: {
-                        title: {
-                            display: !!chartData.y_label,
-                            text: chartData.y_label || 'Y Axis'
+                    };
+                } else {
+                    config.options.scales = {
+                        x: {
+                            title: {
+                                display: !!chartData.x_label,
+                                text: chartData.x_label || 'X Axis'
+                            }
+                        },
+                        y: {
+                            title: {
+                                display: !!chartData.y_label,
+                                text: chartData.y_label || 'Y Axis'
+                            }
                         }
-                    }
-                };
+                    };
+                }
             } else if (chartType === 'line_chart' && data.points) {
                 // Line chart in raw data mode (no aggregation)
                 config.data = {
@@ -310,21 +379,22 @@
                         }
                     });
                 } else {
-                    config.data = {
-                        labels: data.labels || [],
-                        datasets: [{
-                            label: chartData.y_label || 'Value',
-                            data: data.values || [],
-                            backgroundColor: chartType === 'bar_chart' || chartType === 'count_chart' 
-                                ? colors 
-                                : 'rgba(102, 126, 234, 0.6)',
-                            borderColor: 'rgba(102, 126, 234, 1)',
-                            borderWidth: 2,
-                            fill: chartType === 'line_chart'
-                        }]
-                    };
-
-                    if (chartType === 'line_chart') {
+                    // Handle bar charts and aggregated line charts
+                    if (chartType === 'line_chart' && data.labels && data.values) {
+                        // Aggregated line chart
+                        config.data = {
+                            labels: data.labels || [],
+                            datasets: [{
+                                label: chartData.y_label || 'Value',
+                                data: data.values || [],
+                                backgroundColor: 'rgba(102, 126, 234, 0.2)',
+                                borderColor: 'rgba(102, 126, 234, 1)',
+                                borderWidth: 2,
+                                pointRadius: 4,
+                                pointHoverRadius: 6,
+                                fill: true
+                            }]
+                        };
                         config.options.scales = {
                             y: {
                                 beginAtZero: true,
@@ -341,6 +411,22 @@
                             }
                         };
                     } else {
+                        // Bar charts
+                        config.data = {
+                            labels: data.labels || [],
+                            datasets: [{
+                                label: chartData.y_label || 'Value',
+                                data: data.values || [],
+                                backgroundColor: chartType === 'bar_chart' || chartType === 'count_chart' 
+                                    ? colors 
+                                    : 'rgba(102, 126, 234, 0.6)',
+                                borderColor: 'rgba(102, 126, 234, 1)',
+                                borderWidth: 2
+                            }]
+                        };
+                    }
+
+                    if (chartType !== 'line_chart') {
                         config.options.scales = {
                             y: {
                                 beginAtZero: true,

@@ -42,6 +42,18 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 The API will be available at `http://localhost:8001`
 
+**Note**: To run on a different server or allow remote access, use:
+```bash
+uvicorn main:app --reload --host 0.0.0.0 --port 8001
+```
+
+**Optional CORS Configuration**: Set environment variable to restrict which frontends can access:
+```bash
+export CORS_ORIGINS="http://your-frontend-server.com,http://localhost:8000"
+# Or allow all (default):
+export CORS_ORIGINS="*"
+```
+
 ### Frontend Setup (Laravel)
 
 1. Navigate to the frontend directory:
@@ -71,7 +83,16 @@ php artisan serve
 
 The frontend will be available at `http://localhost:8000`
 
-**Note**: Make sure to set `PYTHON_API_URL=http://localhost:8001` in your `.env` file
+**Note**: Make sure to set `PYTHON_API_URL` in your `.env` file:
+- For local backend: `PYTHON_API_URL=http://localhost:8001`
+- For remote backend: `PYTHON_API_URL=http://your-backend-server-ip:8001`
+- For production: `PYTHON_API_URL=https://api.yourdomain.com`
+
+After changing `.env`, clear config cache:
+```bash
+php artisan config:clear
+php artisan cache:clear
+```
 
 ## Quick Start
 
