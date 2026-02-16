@@ -7,8 +7,26 @@ import json
 from collections import Counter
 from datetime import datetime
 import statistics
+import time
+import random
 
 import os
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skip .env loading
+    pass
+
+# OpenAI import with graceful fallback
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    print("Warning: OpenAI library not installed. AI features will be disabled.")
 
 app = FastAPI(title="Report Analysis API")
 
@@ -45,6 +63,9 @@ class ChartConfig(BaseModel):
 class ReportRequest(BaseModel):
     report_data: List[Dict[str, Any]]
     chart_configs: List[ChartConfig]
+
+class AIReportRequest(BaseModel):
+    report_data: List[Dict[str, Any]]
 
 def aggregate_values(values: List[float], aggregate_type: str) -> float:
     """Aggregate a list of values based on aggregate type"""
@@ -544,6 +565,354 @@ def try_convert_sort(value: str):
     # Return as string
     return value
 
+def analyze_columns(report_data: List[Dict]) -> Dict[str, Dict[str, Any]]:
+    """Analyze columns in report data to determine types"""
+    if not report_data or len(report_data) == 0:
+        return {}
+    
+    first_row = report_data[0]
+    columns = list(first_row.keys())
+    column_types = {}
+    
+    # Sample multiple rows for better detection (up to 10 rows)
+    sample_rows = report_data[:min(10, len(report_data))]
+    
+    date_formats_to_try = [
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+        "%d-%b-%Y",  # 01-Feb-2026
+        "%d/%b/%Y",
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+    ]
+    
+    date_keywords = ['date', 'time', 'created', 'updated', 'modified', 'timestamp']
+    
+    for col in columns:
+        is_numeric = False
+        is_date = False
+        date_count = 0
+        numeric_count = 0
+        total_samples = 0
+        
+        # Check multiple sample values
+        for row in sample_rows:
+            sample_value = row.get(col)
+            if sample_value is None or sample_value == '':
+                continue
+            total_samples += 1
+            
+            # Check if numeric
+            try:
+                float(sample_value)
+                numeric_count += 1
+            except (ValueError, TypeError):
+                # Check if date
+                if isinstance(sample_value, str):
+                    matches_date = False
+                    for fmt in date_formats_to_try:
+                        try:
+                            datetime.strptime(sample_value, fmt)
+                            matches_date = True
+                            break
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    # Additional check: column name suggests date
+                    if not matches_date:
+                        col_lower = col.lower()
+                        for keyword in date_keywords:
+                            if keyword in col_lower:
+                                try:
+                                    datetime.strptime(sample_value, "%Y-%m-%d")
+                                    matches_date = True
+                                    break
+                                except (ValueError, TypeError):
+                                    pass
+                    
+                    if matches_date:
+                        date_count += 1
+        
+        # Determine type based on majority of samples
+        if total_samples > 0:
+            numeric_ratio = numeric_count / total_samples
+            date_ratio = date_count / total_samples
+            
+            if numeric_ratio > 0.5:
+                is_numeric = True
+            elif date_ratio > 0.5:
+                is_date = True
+            elif date_count > 0:
+                # If at least one date found and column name suggests date
+                col_lower = col.lower()
+                for keyword in date_keywords:
+                    if keyword in col_lower:
+                        is_date = True
+                        break
+        
+        column_types[col] = {
+            'type': 'numeric' if is_numeric else ('date' if is_date else 'categorical'),
+            'is_numeric': is_numeric,
+            'is_date': is_date,
+            'sample': first_row.get(col)
+        }
+    
+    return column_types
+
+def call_openai_with_retry(client: Any, messages: List[Dict], max_retries: int = 3, base_delay: float = 1.0) -> Any:
+    """
+    Call OpenAI API with exponential backoff retry logic
+    
+    Best practices:
+    - Retry on rate limits and transient errors
+    - Exponential backoff with jitter
+    - Validate response structure
+    """
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # Using gpt-4o-mini for cost efficiency, can be changed to gpt-4o or gpt-4
+                messages=messages,
+                temperature=0.3,  # Lower temperature for more consistent, structured output
+                response_format={"type": "json_object"},  # Force JSON mode for structured output
+                max_tokens=2000
+            )
+            
+            # Extract and parse JSON response
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("Empty response from OpenAI")
+            
+            parsed_response = json.loads(content)
+            return parsed_response
+            
+        except json.JSONDecodeError as e:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff with jitter
+                time.sleep(delay)
+                continue
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to parse OpenAI response as JSON: {str(e)}. Response: {content[:200]}"
+            )
+        except Exception as e:
+            error_str = str(e).lower()
+            # Retry on rate limits and transient errors
+            if any(keyword in error_str for keyword in ['rate limit', 'timeout', 'connection', '503', '429']):
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(delay)
+                    continue
+            raise HTTPException(
+                status_code=500,
+                detail=f"OpenAI API error: {str(e)}"
+            )
+    
+    raise HTTPException(status_code=500, detail="Failed to get response from OpenAI after retries")
+
+def generate_chart_configs_with_ai(report_data: List[Dict]) -> List[Dict[str, Any]]:
+    """
+    Use OpenAI to generate chart configurations based on report data from a business perspective
+    
+    Best practices implemented:
+    1. JSON mode for structured output
+    2. Retry logic with exponential backoff
+    3. Sample data to reduce token usage
+    4. Clear system prompt for consistent results
+    5. Lower temperature for structured data
+    6. Response validation
+    """
+    if not OPENAI_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI library not available. Please install it with: pip install openai"
+        )
+    
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY environment variable is not set"
+        )
+    
+    client = OpenAI(api_key=api_key)
+    
+    # Analyze columns first (use full data for column analysis)
+    column_types = analyze_columns(report_data)
+    
+    # Sample only first 10 rows for AI analysis to reduce token usage
+    sample_size = min(10, len(report_data))
+    sample_data = report_data[:sample_size]
+    
+    # Prepare column information
+    columns_info = []
+    for col, info in column_types.items():
+        columns_info.append({
+            "name": col,
+            "type": info['type'],
+            "sample_value": str(info['sample'])[:50] if info['sample'] is not None else None
+        })
+    
+    # System prompt for consistent, business-focused chart recommendations
+    system_prompt = """You are a business intelligence analyst expert at creating meaningful data visualizations. 
+Your task is to analyze report data and suggest chart configurations that provide business insights.
+
+Available chart types:
+1. bar_chart - For comparing categories (requires: column, aggregate, aggregate_column, title)
+2. pie_chart - For showing proportions (requires: column, aggregate, aggregate_column, title)
+3. line_chart - For trends over time or categories (requires: column + aggregate OR x_column + y_column, title)
+4. xy_chart / scatter_chart - For relationships between two numeric variables (requires: x_column, y_column, title)
+5. grouped_bar_chart - For comparing multiple series within groups (requires: group_column, series_column, aggregate, aggregate_column, title)
+
+Available aggregate functions:
+- COUNT: Count of rows (aggregate_column can be "all" or omitted)
+- DISTINCT_COUNT: Count of distinct values (aggregate_column can be "all" or a specific column)
+- SUM: Sum of numeric column (aggregate_column required, must be numeric)
+- AVG/MEAN: Average of numeric column (aggregate_column required, must be numeric)
+- MIN: Minimum value (aggregate_column required, must be numeric)
+- MAX: Maximum value (aggregate_column required, must be numeric)
+- MEDIAN: Median value (aggregate_column required, must be numeric)
+- MODE: Most common value (aggregate_column required)
+- PERCENTAGE: Percentage distribution (aggregate_column required)
+
+For line_chart:
+- **Aggregated mode (PREFERRED for time-based trends)**: Use column + aggregate + aggregate_column
+  - Use this for trends over time (e.g., "Sales over time", "Count by Date")
+  - Example: {"chart_type": "line_chart", "column": "Date", "aggregate": "SUM", "aggregate_column": "TotalAmt", "title": "Total Sales Over Time"}
+  - When showing trends over time, ALWAYS use aggregated mode with column (date column) + aggregate + aggregate_column
+- **Raw data mode**: Use x_column + y_column (only for scatter-like relationships, not time trends)
+  - Only use this for non-time-based relationships between two numeric variables
+  - Example: {"chart_type": "line_chart", "x_column": "Price", "y_column": "Quantity", "title": "Price vs Quantity"}
+
+IMPORTANT RULES:
+- **For time-based line charts (trends over time)**: ALWAYS use aggregated mode with column (date) + aggregate + aggregate_column
+- Only use numeric columns for SUM, AVG, MIN, MAX, MEDIAN aggregations
+- Use categorical columns for COUNT, DISTINCT_COUNT
+- For xy_chart/scatter_chart: x_column can be numeric or date, y_column must be numeric
+- When you see date columns and want to show trends over time, use line_chart in aggregated mode
+- **IMPORTANT: You can create multiple charts of the same type if it provides different business insights**
+  - For example: Multiple bar charts showing different KPIs (Orders by Status, Orders by Party Type, etc.)
+  - For example: Multiple line charts showing different metrics over time (Sales over time, Orders over time, etc.)
+  - For example: Multiple pie charts showing different distributions
+  - Focus on business value, not chart type variety
+- Generate 3-9 chart configurations that provide meaningful business insights (can be same or different chart types)
+- Make titles descriptive and business-focused
+- Include appropriate x_label and y_label for clarity
+
+Return ONLY a valid JSON object with this exact structure:
+{
+  "chart_configs": [
+    {
+      "chart_type": "bar_chart",
+      "column": "column_name",
+      "aggregate": "COUNT",
+      "aggregate_column": "all",
+      "title": "Descriptive Business Title",
+      "x_label": "X Axis Label",
+      "y_label": "Y Axis Label"
+    },
+    {
+      "chart_type": "line_chart",
+      "column": "Date",
+      "aggregate": "SUM",
+      "aggregate_column": "TotalAmt",
+      "title": "Total Sales Over Time",
+      "x_label": "Date",
+      "y_label": "Total Amount"
+    }
+  ]
+}
+
+Note: For line_chart showing trends over time, use aggregated mode (column + aggregate + aggregate_column), NOT raw mode (x_column + y_column)."""
+
+    # User prompt with data context
+    user_prompt = f"""Please provide chart configurations for this report data based on business perspective.
+
+Report has {len(report_data)} total rows (showing first {len(sample_data)} rows for analysis) with the following columns:
+{json.dumps(columns_info, indent=2)}
+
+Sample data (first {len(sample_data)} rows):
+{json.dumps(sample_data, indent=2)}
+
+Generate 3-9 chart configurations that would provide meaningful business insights. Consider:
+- Key performance indicators (KPIs)
+- Trends and patterns
+- Comparisons and distributions
+- Relationships between variables
+
+**Important:** You can create multiple charts of the same type if they show different business insights. For example:
+- Multiple bar charts for different categorical breakdowns (Orders by Status, Orders by Party Type, Orders by State)
+- Multiple line charts for different metrics over time (Sales over time, Order count over time, Average order value over time)
+- Multiple pie charts for different distributions
+
+Focus on business value and insights, not on having one of each chart type. If multiple charts of the same type provide better insights, create them."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    try:
+        # Call OpenAI with retry logic
+        response = call_openai_with_retry(client, messages)
+        
+        # Validate response structure
+        if not isinstance(response, dict):
+            raise ValueError("Response is not a dictionary")
+        
+        chart_configs = response.get("chart_configs", [])
+        if not isinstance(chart_configs, list):
+            raise ValueError("chart_configs is not a list")
+        
+        if len(chart_configs) == 0:
+            raise ValueError("No chart configurations returned")
+        
+        # Validate each config matches ChartConfig structure
+        validated_configs = []
+        for config in chart_configs:
+            try:
+                # Validate required fields based on chart type
+                chart_type = config.get("chart_type", "").lower()
+                
+                if chart_type in ["bar_chart", "pie_chart"]:
+                    if not config.get("column"):
+                        continue  # Skip invalid configs
+                elif chart_type in ["xy_chart", "scatter_chart"]:
+                    if not config.get("x_column") or not config.get("y_column"):
+                        continue
+                elif chart_type == "line_chart":
+                    # Can be either aggregated or raw mode
+                    if not (config.get("column") or config.get("x_column")):
+                        continue
+                elif chart_type == "grouped_bar_chart":
+                    if not config.get("group_column") or not config.get("series_column"):
+                        continue
+                else:
+                    continue  # Skip unknown chart types
+                
+                # Ensure aggregate_column is set for COUNT if not specified
+                if config.get("aggregate") == "COUNT" and not config.get("aggregate_column"):
+                    config["aggregate_column"] = "all"
+                
+                validated_configs.append(config)
+            except Exception as e:
+                # Skip invalid configs, log but don't fail
+                print(f"Warning: Skipping invalid chart config: {str(e)}")
+                continue
+        
+        if len(validated_configs) == 0:
+            raise ValueError("No valid chart configurations after validation")
+        
+        return validated_configs
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating chart configurations with AI: {str(e)}"
+        )
+
 @app.get("/api/analyze")
 async def analyze_report(
     report_data: str = Query(..., description="JSON string of report data"),
@@ -606,9 +975,107 @@ async def analyze_report_post(request: ReportRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/analyze-ai")
+async def analyze_report_with_ai(request: AIReportRequest):
+    """
+    Use AI to generate chart configurations and apply them to full report data
+    
+    This endpoint:
+    1. Uses only first 10 rows for AI analysis (reduces token usage)
+    2. Generates chart configurations using OpenAI
+    3. Applies those configs to the FULL report data you sent
+    4. Returns chart data ready to plot (points, labels, values, etc.)
+    
+    Best practices implemented:
+    - Only uses first 10 rows for AI analysis (reduces token usage)
+    - Applies configs to full dataset for accurate results
+    - JSON mode for structured output
+    - Retry logic with exponential backoff
+    - Response validation
+    - Error handling
+    """
+    try:
+        if not request.report_data or len(request.report_data) == 0:
+            raise HTTPException(status_code=400, detail="report_data is required and cannot be empty")
+        
+        # Store full report data
+        full_report_data = request.report_data
+        
+        # Generate chart configurations using AI (only uses first 10 rows internally)
+        chart_configs = generate_chart_configs_with_ai(full_report_data)
+        
+        # Convert to ChartConfig models for validation
+        validated_configs = []
+        for config_dict in chart_configs:
+            try:
+                config = ChartConfig(**config_dict)
+                validated_configs.append(config)
+            except Exception as e:
+                # Skip invalid configs
+                print(f"Warning: Invalid chart config skipped: {str(e)}")
+                continue
+        
+        if len(validated_configs) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="AI generated chart configurations, but none were valid"
+            )
+        
+        # Apply chart configs to FULL report data and generate chart data
+        charts = []
+        for config in validated_configs:
+            chart_data = analyze_data_for_chart(full_report_data, config)
+            charts.append(chart_data)
+        
+        return JSONResponse(content={
+            "success": True,
+            "charts": charts,  # Chart data ready to plot
+            "chart_configs": [config.dict() for config in validated_configs],  # For reference
+            "report_count": len(full_report_data)
+        })
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/analyze-ai")
+async def analyze_ai_info():
+    """GET endpoint to show usage information for /api/analyze-ai"""
+    return {
+        "message": "AI Chart Configuration Endpoint",
+        "method": "POST",
+        "description": "Use POST method to send report data and get AI-generated chart configurations with chart data",
+        "request_body": {
+            "report_data": "Array of report data objects"
+        },
+        "response": {
+            "success": "boolean",
+            "charts": "Array of chart data ready to plot",
+            "chart_configs": "Array of AI-generated chart configurations",
+            "report_count": "Number of rows in report"
+        },
+        "example": {
+            "method": "POST",
+            "url": "/api/analyze-ai",
+            "body": {
+                "report_data": [
+                    {"column1": "value1", "column2": 123}
+                ]
+            }
+        }
+    }
+
 @app.get("/")
 async def root():
-    return {"message": "Report Analysis API", "endpoints": ["/api/analyze"]}
+    return {
+        "message": "Report Analysis API",
+        "endpoints": [
+            "/api/analyze (POST/GET)",
+            "/api/analyze-ai (POST only - use POST method)"
+        ],
+        "note": "Visit /api/analyze-ai with GET to see usage information"
+    }
 
 if __name__ == "__main__":
     import uvicorn
