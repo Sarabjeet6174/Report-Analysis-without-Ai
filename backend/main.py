@@ -9,7 +9,7 @@ from datetime import datetime
 import statistics
 import time
 import random
-
+import logging
 import os
 
 # Load environment variables from .env file if it exists
@@ -27,6 +27,14 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
     print("Warning: OpenAI library not installed. AI features will be disabled.")
+
+# Basic application logger
+logger = logging.getLogger("report_analysis")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
 
 app = FastAPI(title="Report Analysis API")
 
@@ -66,6 +74,8 @@ class ReportRequest(BaseModel):
 
 class AIReportRequest(BaseModel):
     report_data: List[Dict[str, Any]]
+    include_suggestions: bool = True
+    report_prompt: Optional[str] = None
 
 def aggregate_values(values: List[float], aggregate_type: str) -> float:
     """Aggregate a list of values based on aggregate type"""
@@ -670,6 +680,7 @@ def call_openai_with_retry(client: Any, messages: List[Dict], max_retries: int =
     """
     for attempt in range(max_retries):
         try:
+            logger.info("Calling OpenAI (attempt %d/%d)...", attempt + 1, max_retries)
             response = client.chat.completions.create(
                 model="gpt-4o-mini",  # Using gpt-4o-mini for cost efficiency, can be changed to gpt-4o or gpt-4
                 messages=messages,
@@ -684,9 +695,11 @@ def call_openai_with_retry(client: Any, messages: List[Dict], max_retries: int =
                 raise ValueError("Empty response from OpenAI")
             
             parsed_response = json.loads(content)
+            logger.info("OpenAI call succeeded on attempt %d", attempt + 1)
             return parsed_response
             
         except json.JSONDecodeError as e:
+            logger.warning("Failed to parse OpenAI JSON response on attempt %d: %s", attempt + 1, str(e))
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt) + random.uniform(0, 1)  # Exponential backoff with jitter
                 time.sleep(delay)
@@ -697,6 +710,7 @@ def call_openai_with_retry(client: Any, messages: List[Dict], max_retries: int =
             )
         except Exception as e:
             error_str = str(e).lower()
+            logger.warning("OpenAI error on attempt %d: %s", attempt + 1, str(e))
             # Retry on rate limits and transient errors
             if any(keyword in error_str for keyword in ['rate limit', 'timeout', 'connection', '503', '429']):
                 if attempt < max_retries - 1:
@@ -708,9 +722,10 @@ def call_openai_with_retry(client: Any, messages: List[Dict], max_retries: int =
                 detail=f"OpenAI API error: {str(e)}"
             )
     
+    logger.error("Exhausted OpenAI retries without success")
     raise HTTPException(status_code=500, detail="Failed to get response from OpenAI after retries")
 
-def generate_chart_configs_with_ai(report_data: List[Dict]) -> List[Dict[str, Any]]:
+def generate_chart_configs_with_ai(report_data: List[Dict], report_prompt: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Use OpenAI to generate chart configurations based on report data from a business perspective
     
@@ -722,6 +737,12 @@ def generate_chart_configs_with_ai(report_data: List[Dict]) -> List[Dict[str, An
     5. Lower temperature for structured data
     6. Response validation
     """
+    logger.info(
+        "generate_chart_configs_with_ai: rows=%d, report_prompt=%r",
+        len(report_data),
+        report_prompt,
+    )
+
     if not OPENAI_AVAILABLE:
         raise HTTPException(
             status_code=503,
@@ -736,6 +757,7 @@ def generate_chart_configs_with_ai(report_data: List[Dict]) -> List[Dict[str, An
         )
     
     client = OpenAI(api_key=api_key)
+    logger.info("OpenAI client created for chart config generation")
     
     # Analyze columns first (use full data for column analysis)
     column_types = analyze_columns(report_data)
@@ -825,7 +847,12 @@ Return ONLY a valid JSON object with this exact structure:
 
 Note: For line_chart showing trends over time, use aggregated mode (column + aggregate + aggregate_column), NOT raw mode (x_column + y_column)."""
 
-    # User prompt with data context
+    # User prompt with data context (optionally guided by user-specified report focus)
+    focus_text = (
+        f"User requested report focus: {report_prompt}\\n\\n"
+        if report_prompt
+        else ""
+    )
     user_prompt = f"""Please provide chart configurations for this report data based on business perspective.
 
 Report has {len(report_data)} total rows (showing first {len(sample_data)} rows for analysis) with the following columns:
@@ -845,7 +872,7 @@ Generate 3-9 chart configurations that would provide meaningful business insight
 - Multiple line charts for different metrics over time (Sales over time, Order count over time, Average order value over time)
 - Multiple pie charts for different distributions
 
-Focus on business value and insights, not on having one of each chart type. If multiple charts of the same type provide better insights, create them."""
+{focus_text}Focus on business value and insights, not on having one of each chart type. If multiple charts of the same type provide better insights, create them."""
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -854,7 +881,12 @@ Focus on business value and insights, not on having one of each chart type. If m
     
     try:
         # Call OpenAI with retry logic
+        start_time = time.time()
         response = call_openai_with_retry(client, messages)
+        logger.info(
+            "generate_chart_configs_with_ai: OpenAI response received in %.2fs",
+            time.time() - start_time,
+        )
         
         # Validate response structure
         if not isinstance(response, dict):
@@ -903,14 +935,456 @@ Focus on business value and insights, not on having one of each chart type. If m
         if len(validated_configs) == 0:
             raise ValueError("No valid chart configurations after validation")
         
+        logger.info(
+            "generate_chart_configs_with_ai: returning %d validated configs",
+            len(validated_configs),
+        )
         return validated_configs
         
     except HTTPException:
         raise
     except Exception as e:
+        logger.error("Error in generate_chart_configs_with_ai: %s", str(e))
         raise HTTPException(
             status_code=500,
             detail=f"Error generating chart configurations with AI: {str(e)}"
+        )
+
+
+def generate_chart_configs_and_suggestions_with_ai(report_data: List[Dict], report_prompt: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Single OpenAI call that returns BOTH:
+    - chart_configs: list of chart configuration dicts
+    - suggestions: structured business/data analysis object
+    """
+    logger.info(
+        "generate_chart_configs_and_suggestions_with_ai: rows=%d, report_prompt=%r",
+        len(report_data),
+        report_prompt,
+    )
+
+    if not OPENAI_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI library not available. Please install it with: pip install openai"
+        )
+    
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY environment variable is not set"
+        )
+    
+    client = OpenAI(api_key=api_key)
+    logger.info("OpenAI client created for chart configs + suggestions")
+    
+    # Analyze columns for chart configs
+    column_types = analyze_columns(report_data) if report_data else {}
+    
+    # Sample rows for token control (use 20 rows as a middle ground for both tasks)
+    sample_size = min(20, len(report_data))
+    sample_data = report_data[:sample_size]
+    
+    # Prepare column information (for chart configs)
+    columns_info = []
+    for col, info in column_types.items():
+        columns_info.append({
+            "name": col,
+            "type": info["type"],
+            "sample_value": str(info["sample"])[:50] if info.get("sample") is not None else None,
+        })
+    
+    # Combined system prompt: chart configs + business suggestions
+    system_prompt = """You are both:
+1) A business intelligence analyst expert at creating meaningful data visualizations.
+2) A business and data analyst focused on extracting insights, risks, and opportunities.
+
+Your task is to:
+- Suggest chart configurations that provide strong business insights.
+- Produce a structured business/data analysis summary with key observations, trends, issues, and recommendations.
+
+=== CHART CONFIGURATIONS PART ===
+
+Available chart types:
+1. bar_chart - For comparing categories (requires: column, aggregate, aggregate_column, title)
+2. pie_chart - For showing proportions (requires: column, aggregate, aggregate_column, title)
+3. line_chart - For trends over time or categories (requires: column + aggregate OR x_column + y_column, title)
+4. xy_chart / scatter_chart - For relationships between two numeric variables (requires: x_column, y_column, title)
+5. grouped_bar_chart - For comparing multiple series within groups (requires: group_column, series_column, aggregate, aggregate_column, title)
+
+Available aggregate functions:
+- COUNT: Count of rows (aggregate_column can be "all" or omitted)
+- DISTINCT_COUNT: Count of distinct values (aggregate_column can be "all" or a specific column)
+- SUM: Sum of numeric column (aggregate_column required, must be numeric)
+- AVG/MEAN: Average of numeric column (aggregate_column required, must be numeric)
+- MIN: Minimum value (aggregate_column required, must be numeric)
+- MAX: Maximum value (aggregate_column required, must be numeric)
+- MEDIAN: Median value (aggregate_column required, must be numeric)
+- MODE: Most common value (aggregate_column required)
+- PERCENTAGE: Percentage distribution (aggregate_column required)
+
+For line_chart:
+- Aggregated mode (PREFERRED for time-based trends): Use column + aggregate + aggregate_column
+  - Use this for trends over time (e.g., "Sales over time", "Count by Date")
+- Raw data mode: Use x_column + y_column (only for scatter-like relationships, not time trends)
+
+IMPORTANT RULES FOR CHARTS:
+- For time-based line charts (trends over time): ALWAYS use aggregated mode with column (date) + aggregate + aggregate_column.
+- Only use numeric columns for SUM, AVG, MIN, MAX, MEDIAN aggregations.
+- Use categorical columns for COUNT, DISTINCT_COUNT.
+- For xy_chart/scatter_chart: x_column can be numeric or date, y_column must be numeric.
+- You can create multiple charts of the same type if they provide different business insights (e.g., multiple bar charts for different categorical breakdowns).
+- Generate 5–9 chart configurations that provide meaningful business insights.
+- Make titles descriptive and business-focused, and include x_label and y_label where helpful.
+
+The chart configurations MUST be returned under the key "chart_configs" as:
+{
+  "chart_configs": [
+    {
+      "chart_type": "bar_chart",
+      "column": "column_name",
+      "aggregate": "COUNT",
+      "aggregate_column": "all",
+      "title": "Descriptive Business Title",
+      "x_label": "X Axis Label",
+      "y_label": "Y Axis Label"
+    }
+  ],
+  ...
+}
+
+=== BUSINESS/DATA ANALYSIS SUGGESTIONS PART ===
+
+You are also a business and data analyst.
+
+Analyze the provided report data carefully and produce meaningful insights. 
+Your goal is to identify trends, anomalies, risks, and opportunities in the data.
+
+Steps to follow:
+1. Understand the structure of the report and key fields such as revenue, costs, quantities, customer data, product data, dates, and other metrics.
+2. Identify patterns and trends in the data (growth, decline, seasonality, unusual spikes).
+3. Highlight important metrics such as totals, averages, ratios, and comparisons where relevant.
+4. Detect any anomalies, inconsistencies, or possible data quality issues.
+5. Provide business insights explaining what the data suggests about performance.
+6. Suggest actionable recommendations based on the analysis.
+7. Mention potential risks or areas that require attention.
+8. If useful, propose additional metrics or visualizations that could help understand the data better.
+
+The suggestions MUST be returned under the key "suggestions" with this exact shape:
+{
+  "suggestions": {
+    "summary": "Summary of the report",
+    "key_observations": ["...", "..."],
+    "important_trends": ["...", "..."],
+    "detected_issues": ["...", "..."],
+    "business_insights": ["...", "..."],
+    "recommendations": ["...", "..."],
+    "suggested_charts": ["...", "..."]
+  }
+}
+
+=== FINAL OUTPUT FORMAT (CRITICAL) ===
+
+Return ONLY a single valid JSON object with this exact top-level structure:
+{
+  "chart_configs": [ ... ],   // list of chart configuration objects
+  "suggestions": {
+    "summary": "Summary of the report",
+    "key_observations": ["...", "..."],
+    "important_trends": ["...", "..."],
+    "detected_issues": ["...", "..."],
+    "business_insights": ["...", "..."],
+    "recommendations": ["...", "..."],
+    "suggested_charts": ["...", "..."]
+  }
+}
+
+Do not include any explanatory text outside of this JSON object."""
+
+    focus_text = (
+        f"User requested report focus: {report_prompt}\\n\\n"
+        if report_prompt
+        else ""
+    )
+    user_prompt = f"""We have tabular report data.
+
+Total rows in report: {len(report_data)}.
+Showing first {len(sample_data)} rows for analysis to stay within token limits.
+
+Column information (for chart design):
+{json.dumps(columns_info, indent=2)}
+
+Sample data (first {len(sample_data)} rows):
+{json.dumps(sample_data, indent=2)}
+
+Using this data, please:
+1) Propose 3–9 business-meaningful chart configurations under "chart_configs".
+2) Provide structured business/data analysis under "suggestions" following the exact JSON shape specified in the system message.
+
+{focus_text}Respond ONLY with a valid JSON object with "chart_configs" and "suggestions" at the top level."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    
+    try:
+        start_time = time.time()
+        response = call_openai_with_retry(client, messages)
+        logger.info(
+            "generate_chart_configs_and_suggestions_with_ai: OpenAI response received in %.2fs",
+            time.time() - start_time,
+        )
+        if not isinstance(response, dict):
+            raise ValueError("AI response is not a JSON object")
+        
+        # Extract and validate chart configs
+        chart_configs = response.get("chart_configs", [])
+        if not isinstance(chart_configs, list):
+            raise ValueError("chart_configs is not a list")
+        
+        if len(chart_configs) == 0:
+            raise ValueError("No chart configurations returned")
+        
+        validated_configs: List[Dict[str, Any]] = []
+        for config in chart_configs:
+            try:
+                chart_type = str(config.get("chart_type", "")).lower()
+                
+                if chart_type in ["bar_chart", "pie_chart"]:
+                    if not config.get("column"):
+                        continue
+                elif chart_type in ["xy_chart", "scatter_chart"]:
+                    if not config.get("x_column") or not config.get("y_column"):
+                        continue
+                elif chart_type == "line_chart":
+                    if not (config.get("column") or config.get("x_column")):
+                        continue
+                elif chart_type == "grouped_bar_chart":
+                    if not config.get("group_column") or not config.get("series_column"):
+                        continue
+                else:
+                    continue
+                
+                # Ensure aggregate_column is set for COUNT if not specified
+                if config.get("aggregate") == "COUNT" and not config.get("aggregate_column"):
+                    config["aggregate_column"] = "all"
+                
+                validated_configs.append(config)
+            except Exception as e:
+                print(f"Warning: Skipping invalid chart config in combined AI call: {str(e)}")
+                continue
+        
+        if len(validated_configs) == 0:
+            raise ValueError("No valid chart configurations after validation")
+        
+        logger.info(
+            "generate_chart_configs_and_suggestions_with_ai: %d validated configs",
+            len(validated_configs),
+        )
+
+        # Extract and normalize suggestions
+        raw_suggestions = response.get("suggestions", {})
+        if not isinstance(raw_suggestions, dict):
+            raw_suggestions = {}
+        
+        suggestions = {
+            "summary": raw_suggestions.get("summary", ""),
+            "key_observations": raw_suggestions.get("key_observations", []),
+            "important_trends": raw_suggestions.get("important_trends", []),
+            "detected_issues": raw_suggestions.get("detected_issues", []),
+            "business_insights": raw_suggestions.get("business_insights", []),
+            "recommendations": raw_suggestions.get("recommendations", []),
+            "suggested_charts": raw_suggestions.get("suggested_charts", []),
+        }
+        
+        for key in [
+            "key_observations",
+            "important_trends",
+            "detected_issues",
+            "business_insights",
+            "recommendations",
+            "suggested_charts",
+        ]:
+            value = suggestions.get(key, [])
+            if isinstance(value, list):
+                suggestions[key] = [str(item) for item in value]
+            elif isinstance(value, str):
+                suggestions[key] = [value]
+            else:
+                suggestions[key] = []
+        
+        if not isinstance(suggestions["summary"], str):
+            suggestions["summary"] = str(suggestions["summary"])
+        
+        logger.info(
+            "generate_chart_configs_and_suggestions_with_ai: suggestions sections - summary_present=%s, observations=%d, recommendations=%d",
+            bool(suggestions.get("summary")),
+            len(suggestions.get("key_observations", [])),
+            len(suggestions.get("recommendations", [])),
+        )
+
+        return {
+            "chart_configs": validated_configs,
+            "suggestions": suggestions,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            "Error in generate_chart_configs_and_suggestions_with_ai: %s", str(e)
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating chart configurations and suggestions with AI: {str(e)}",
+        )
+
+
+def generate_report_suggestions_with_ai(report_data: List[Dict]) -> Dict[str, Any]:
+    """
+    Use OpenAI to generate business and data analysis suggestions for the report.
+    
+    Returns a structured JSON object with:
+    - summary
+    - key_observations
+    - important_trends
+    - detected_issues
+    - business_insights
+    - recommendations
+    - suggested_charts
+    """
+    logger.info(
+        "generate_report_suggestions_with_ai: rows=%d",
+        len(report_data),
+    )
+
+    if not OPENAI_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail="OpenAI library not available. Please install it with: pip install openai",
+        )
+    
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY environment variable is not set",
+        )
+    
+    client = OpenAI(api_key=api_key)
+    logger.info("OpenAI client created for suggestions-only call")
+    
+    # To control token usage, sample up to 50 rows but keep total count info
+    sample_size = min(50, len(report_data))
+    sample_data = report_data[:sample_size]
+    
+    # System prompt based directly on the user's requested analysis instructions
+    system_prompt = """You are a business and data analyst.
+
+Analyze the provided report data carefully and produce meaningful insights. 
+Your goal is to identify trends, anomalies, risks, and opportunities in the data.
+
+Steps to follow:
+
+1. Understand the structure of the report and key fields such as revenue, costs, quantities, customer data, product data, dates, and other metrics.
+2. Identify patterns and trends in the data (growth, decline, seasonality, unusual spikes).
+3. Highlight important metrics such as totals, averages, ratios, and comparisons where relevant.
+4. Detect any anomalies, inconsistencies, or possible data quality issues.
+5. Provide business insights explaining what the data suggests about performance.
+6. Suggest actionable recommendations based on the analysis.
+7. Mention potential risks or areas that require attention.
+8. If useful, propose additional metrics or visualizations that could help understand the data better.
+
+Output format:
+
+Return ONLY a valid JSON object with this exact structure:
+{
+  "summary": "Summary of the report",
+  "key_observations": ["...", "..."],
+  "important_trends": ["...", "..."],
+  "detected_issues": ["...", "..."],
+  "business_insights": ["...", "..."],
+  "recommendations": ["...", "..."],
+  "suggested_charts": ["...", "..."]
+}
+
+Keep the explanation clear, concise, and professional.
+Avoid repeating raw data unless necessary for explaining insights.
+Focus on interpretation rather than simple description."""
+
+    # User prompt with context and (optionally truncated) data
+    user_prompt = f"""You will receive tabular report data as JSON rows.
+
+Total rows in report: {len(report_data)}.
+Showing first {len(sample_data)} rows for analysis to stay within token limits:
+{json.dumps(sample_data, indent=2)}
+
+Analyze this data following the instructions from the system message and respond ONLY with a valid JSON object that matches the specified output format."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    
+    try:
+        start_time = time.time()
+        response = call_openai_with_retry(client, messages)
+        logger.info(
+            "generate_report_suggestions_with_ai: OpenAI response received in %.2fs",
+            time.time() - start_time,
+        )
+        
+        if not isinstance(response, dict):
+            raise ValueError("Suggestions response is not a JSON object")
+        
+        # Basic normalization: ensure all expected keys exist
+        suggestions = {
+            "summary": response.get("summary", ""),
+            "key_observations": response.get("key_observations", []),
+            "important_trends": response.get("important_trends", []),
+            "detected_issues": response.get("detected_issues", []),
+            "business_insights": response.get("business_insights", []),
+            "recommendations": response.get("recommendations", []),
+            "suggested_charts": response.get("suggested_charts", []),
+        }
+        
+        # Ensure list fields are lists of strings
+        for key in [
+            "key_observations",
+            "important_trends",
+            "detected_issues",
+            "business_insights",
+            "recommendations",
+            "suggested_charts",
+        ]:
+            value = suggestions.get(key, [])
+            if isinstance(value, list):
+                suggestions[key] = [str(item) for item in value]
+            elif isinstance(value, str):
+                suggestions[key] = [value]
+            else:
+                suggestions[key] = []
+        
+        # Summary should always be a string
+        if not isinstance(suggestions["summary"], str):
+            suggestions["summary"] = str(suggestions["summary"])
+        
+        logger.info(
+            "generate_report_suggestions_with_ai: suggestions sections - summary_present=%s, observations=%d, recommendations=%d",
+            bool(suggestions.get("summary")),
+            len(suggestions.get("key_observations", [])),
+            len(suggestions.get("recommendations", [])),
+        )
+
+        return suggestions
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error in generate_report_suggestions_with_ai: %s", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating report suggestions with AI: {str(e)}",
         )
 
 @app.get("/api/analyze")
@@ -1000,9 +1474,37 @@ async def analyze_report_with_ai(request: AIReportRequest):
         
         # Store full report data
         full_report_data = request.report_data
-        
-        # Generate chart configurations using AI (only uses first 10 rows internally)
-        chart_configs = generate_chart_configs_with_ai(full_report_data)
+        include_suggestions = request.include_suggestions
+        report_prompt = request.report_prompt
+
+        logger.info(
+            "/api/analyze-ai: rows=%d, include_suggestions=%s, report_prompt=%r",
+            len(full_report_data),
+            include_suggestions,
+            report_prompt,
+        )
+
+        # Use appropriate AI call based on whether suggestions are requested
+        if include_suggestions:
+            logger.info("/api/analyze-ai: calling combined charts+suggestions helper")
+            # Single AI call to get BOTH chart configs and suggestions
+            ai_result = generate_chart_configs_and_suggestions_with_ai(full_report_data, report_prompt=report_prompt)
+            chart_configs = ai_result.get("chart_configs", [])
+            suggestions = ai_result.get("suggestions", {})
+        else:
+            logger.info("/api/analyze-ai: calling charts-only helper (no suggestions)")
+            # Only generate chart configurations, skip expensive suggestions
+            chart_configs = generate_chart_configs_with_ai(full_report_data, report_prompt=report_prompt)
+            # Return an empty suggestions structure with the expected shape
+            suggestions = {
+                "summary": "",
+                "key_observations": [],
+                "important_trends": [],
+                "detected_issues": [],
+                "business_insights": [],
+                "recommendations": [],
+                "suggested_charts": [],
+            }
         
         # Convert to ChartConfig models for validation
         validated_configs = []
@@ -1021,39 +1523,64 @@ async def analyze_report_with_ai(request: AIReportRequest):
                 detail="AI generated chart configurations, but none were valid"
             )
         
+        logger.info(
+            "/api/analyze-ai: %d validated chart configs, generating chart data",
+            len(validated_configs),
+        )
+
         # Apply chart configs to FULL report data and generate chart data
         charts = []
         for config in validated_configs:
             chart_data = analyze_data_for_chart(full_report_data, config)
             charts.append(chart_data)
         
+        logger.info(
+            "/api/analyze-ai: returning %d charts, suggestions_present=%s",
+            len(charts),
+            bool(suggestions.get("summary")) or bool(suggestions.get("key_observations")),
+        )
+
         return JSONResponse(content={
             "success": True,
             "charts": charts,  # Chart data ready to plot
-            "chart_configs": [config.dict() for config in validated_configs],  # For reference
-            "report_count": len(full_report_data)
+            "chart_configs": [config.model_dump() for config in validated_configs],  # For reference
+            "report_count": len(full_report_data),
+            "suggestions": suggestions  # New key with business/data analysis
         })
         
     except HTTPException:
+        logger.exception("/api/analyze-ai: HTTPException")
         raise
     except Exception as e:
+        logger.exception("/api/analyze-ai: unexpected error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/analyze-ai")
 async def analyze_ai_info():
     """GET endpoint to show usage information for /api/analyze-ai"""
     return {
-        "message": "AI Chart Configuration Endpoint",
+        "message": "AI Chart Configuration and Suggestions Endpoint",
         "method": "POST",
-        "description": "Use POST method to send report data and get AI-generated chart configurations with chart data",
+        "description": "Use POST method to send report data and get AI-generated chart configurations, chart data, and business analysis suggestions",
         "request_body": {
-            "report_data": "Array of report data objects"
+            "report_data": "Array of report data objects",
+            "include_suggestions": "Optional boolean. If true (default), the AI also generates business/data suggestions. If false, only chart configurations are generated.",
+            "report_prompt": "Optional string. A natural language description of what kind of report or insights the user wants (e.g., 'Focus on monthly sales trends and top products')."
         },
         "response": {
             "success": "boolean",
             "charts": "Array of chart data ready to plot",
             "chart_configs": "Array of AI-generated chart configurations",
-            "report_count": "Number of rows in report"
+            "report_count": "Number of rows in report",
+            "suggestions": {
+                "summary": "Summary of the report",
+                "key_observations": "Array of key observations",
+                "important_trends": "Array of important trends",
+                "detected_issues": "Array of detected issues or anomalies",
+                "business_insights": "Array of business insights",
+                "recommendations": "Array of recommendations",
+                "suggested_charts": "Array of suggested additional charts or visualizations"
+            }
         },
         "example": {
             "method": "POST",
@@ -1061,7 +1588,9 @@ async def analyze_ai_info():
             "body": {
                 "report_data": [
                     {"column1": "value1", "column2": 123}
-                ]
+                ],
+                "include_suggestions": True,
+                "report_prompt": "Focus on monthly sales trends and top-performing products"
             }
         }
     }
